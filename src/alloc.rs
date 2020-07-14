@@ -9,12 +9,16 @@ const SIZE: usize = 1024 * 1024;
 
 struct Node {
     size: usize,
-    next: Option<&'static mut Node>,
+    next: usize,
 }
 
 impl Node {
     const fn size() -> usize {
         mem::size_of::<Self>()
+    }
+
+    const fn align() -> usize {
+        mem::align_of::<Self>()
     }
 }
 
@@ -48,7 +52,7 @@ impl Allocator {
 
         ptr.write(Node {
             size: self.size - Node::size(),
-            next: None,
+            next: 0,
         });
     }
 
@@ -66,24 +70,38 @@ impl Allocator {
 
         let addr = align(self.head, layout.align())?;
         let ptr = addr as *mut Node;
+        let prev_size = (*ptr).size;
         ptr.write(Node {
             size: layout.size(),
-            next: None,
+            next: 0,
         });
 
-        self.total += layout.size() + Node::size();
+        self.total += layout.size();
         let ptr = addr + Node::size();
-        self.head = layout.size() + ptr;
+        self.head = align(ptr + layout.size(), Node::align())?;
         let head = self.head as *mut Node;
         head.write(Node {
-            size: self.size - self.total,
-            next: None,
+            size: prev_size - Node::size() - layout.size(),
+            next: 0,
         });
 
         Ok(ptr as *mut _)
     }
 
     unsafe fn dealloc(&mut self, ptr: *mut u8, layout: Layout) {
+        assert!(!ptr.is_null());
+
+        if (ptr as usize) < self.head {
+            let addr = ptr as usize - Node::size();
+            let ptr = addr as *mut Node;
+            ptr.write(Node {
+                size: (*ptr).size,
+                next: self.head,
+            });
+
+            self.head = addr;
+        }
+
         self.total -= layout.size();
     }
 }
@@ -139,7 +157,9 @@ mod tests {
             assert_eq!(ptr as usize, node as usize + Node::size());
 
             let node = heap.head as *mut Node;
-            assert_eq!((*node).size, SIZE - Node::size() - 10);
+            assert_eq!((*node).size, SIZE - 2 * Node::size() - 10);
+
+            assert_eq!(heap.total, 10);
         }
         Ok(())
     }
@@ -148,11 +168,7 @@ mod tests {
     fn alloc_twice() -> Result<()> {
         unsafe {
             let mut heap = Allocator::new();
-            assert_eq!(heap.size, 0);
-
             heap.init();
-            let node = heap.head as *mut Node;
-            assert_eq!((*node).size, SIZE - Node::size());
 
             heap.alloc(Layout::from_size_align_unchecked(10, 4))?;
             let aligned = align(heap.head, 8)?;
@@ -161,7 +177,38 @@ mod tests {
             assert_eq!(ptr as usize, Node::size() + aligned);
 
             let node = heap.head as *mut Node;
-            assert_eq!((*node).size, SIZE - 2 * Node::size() - 27);
+            assert_eq!((*node).size, SIZE - 3 * Node::size() - 27);
+            assert_eq!(heap.total, 27);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn dealloc_backwards() -> Result<()> {
+        unsafe {
+            let mut heap = Allocator::new();
+            heap.init();
+
+            let first_head = heap.head;
+            let first_ptr = heap.alloc(Layout::from_size_align_unchecked(10, 4))?;
+            let layout = Layout::from_size_align_unchecked(17, 8);
+            let ptr = heap.alloc(layout.clone())?;
+            let final_head = heap.head;
+
+            heap.dealloc(ptr, layout);
+
+            assert_eq!(heap.head, ptr as usize - Node::size());
+            let node = heap.head as *mut Node;
+            assert_eq!((*node).size, 17); // TODO: coalesce
+            assert_eq!((*node).next, final_head);
+
+            heap.dealloc(first_ptr, Layout::from_size_align_unchecked(10, 4));
+            assert_eq!(heap.head, first_head);
+            let node = heap.head as *mut Node;
+            assert_eq!((*node).size, 10); // TODO: coalesce
+            assert_eq!((*node).next, ptr as usize - Node::size());
+
+            assert_eq!(heap.total, 0);
         }
         Ok(())
     }
