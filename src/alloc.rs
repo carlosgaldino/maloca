@@ -14,10 +14,12 @@ struct Node {
 }
 
 impl Node {
+    #[inline(always)]
     const fn size() -> usize {
         mem::size_of::<Self>()
     }
 
+    #[inline(always)]
     const fn align() -> usize {
         mem::align_of::<Self>()
     }
@@ -69,7 +71,7 @@ impl Allocator {
             return Err(());
         }
 
-        let addr = align(self.head, layout.align())?;
+        let addr = align(self.head, layout.align());
         let ptr = addr as *mut Node;
         let prev_size = (*ptr).size;
         ptr.write(Node {
@@ -79,7 +81,7 @@ impl Allocator {
 
         self.total += layout.size();
         let ptr = addr + Node::size();
-        self.head = align(ptr + layout.size(), Node::align())?;
+        self.head = align(ptr + layout.size(), Node::align());
         let head = self.head as *mut Node;
         head.write(Node {
             size: prev_size - Node::size() - layout.size(),
@@ -136,8 +138,9 @@ unsafe impl GlobalAlloc for LockedAllocator {
     }
 }
 
-fn align(addr: usize, align: usize) -> Result<usize, ()> {
-    Ok((addr + align - 1) & !(align - 1))
+#[inline(always)]
+fn align(addr: usize, align: usize) -> usize {
+    (addr + align - 1) & !(align - 1)
 }
 
 #[inline]
@@ -164,8 +167,8 @@ mod tests {
 
     #[test]
     fn alignment() -> Result<()> {
-        assert_eq!(align(0x1010, 4)?, 0x1010);
-        assert_eq!(align(0x1013, 4)?, 0x1014);
+        assert_eq!(align(0x1010, 4), 0x1010);
+        assert_eq!(align(0x1013, 4), 0x1014);
         Ok(())
     }
 
@@ -198,7 +201,7 @@ mod tests {
             heap.init();
 
             heap.alloc(Layout::from_size_align_unchecked(10, 4))?;
-            let aligned = align(heap.head, 8)?;
+            let aligned = align(heap.head, 8);
             let ptr = heap.alloc(Layout::from_size_align_unchecked(17, 8))?;
 
             assert_eq!(ptr as usize, Node::size() + aligned);
