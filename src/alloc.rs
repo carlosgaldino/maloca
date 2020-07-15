@@ -23,14 +23,6 @@ impl Node {
     const fn align() -> usize {
         mem::align_of::<Self>()
     }
-
-    fn next(&self) -> Option<*mut Self> {
-        if self.next == 0 {
-            return None;
-        }
-
-        Some(self.next as *mut Node)
-    }
 }
 
 #[derive(Debug)]
@@ -112,8 +104,8 @@ impl Allocator {
             (*prev_node).next = ptr as usize;
         }
 
-        if let Some(next) = (*ptr).next() {
-            coalesce(addr, next as usize);
+        if (*ptr).next != 0 {
+            coalesce(addr, (*ptr).next);
         }
 
         if prev != 0 {
@@ -135,7 +127,7 @@ impl LockedAllocator {
 unsafe impl GlobalAlloc for LockedAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let mut heap = self.0.lock();
-        heap.alloc(layout).unwrap_or_else(|_| 0 as *mut u8)
+        heap.alloc(layout).unwrap_or_else(|_| std::ptr::null_mut())
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
