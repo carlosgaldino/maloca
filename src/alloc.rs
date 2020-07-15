@@ -123,14 +123,13 @@ impl Allocator {
         }
 
         if let Some(next) = (*ptr).next() {
-            let next_addr = align(addr + (*ptr).size + Node::size(), Node::align());
-            if next_addr == next as usize {
-                (*ptr).size += (*next).size + Node::size();
-                (*ptr).next = (*next).next;
-            }
+            coalesce(addr, next as usize);
         }
 
-        // TODO: coalesce
+        if prev != 0 {
+            coalesce(prev, addr);
+        }
+
         self.total -= layout.size();
     }
 }
@@ -173,6 +172,17 @@ fn find_previous_node(addr: usize, head: usize) -> usize {
     }
 
     node as usize
+}
+
+#[inline]
+unsafe fn coalesce(prev: usize, current: usize) {
+    let prev_node = prev as *mut Node;
+    let next_addr = align(prev + (*prev_node).size + Node::size(), Node::align());
+    if next_addr == current {
+        let ptr = current as *mut Node;
+        (*prev_node).size += (*ptr).size + Node::size();
+        (*prev_node).next = (*ptr).next;
+    }
 }
 
 #[cfg(test)]
@@ -281,11 +291,10 @@ mod tests {
             assert_eq!(heap.total, 17);
 
             heap.dealloc(ptr, layout);
-            assert_eq!((*node).next, ptr as usize - Node::size());
-            let node = (ptr as usize - Node::size()) as *mut Node;
             assert_eq!((*node).next, 0);
-            assert_eq!((*node).size, SIZE - 2 * Node::size() - 10); // TODO: head should coalesce with prev
-            assert_eq!((*(heap.head as *mut Node)).next, node as usize);
+            let node = heap.head as *mut Node;
+            assert_eq!((*node).next, 0);
+            assert_eq!((*node).size, SIZE - Node::size());
 
             assert_eq!(heap.total, 0);
         }
