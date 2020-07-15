@@ -241,6 +241,12 @@ mod tests {
 
     #[test]
     fn dealloc_backwards() -> Result<()> {
+        // Allocate two blocks
+        // AAAABBB_____________
+        // Free block B
+        // AAAA________________
+        // Free block A
+        // ____________________
         unsafe {
             let mut heap = Allocator::new();
             heap.init();
@@ -248,18 +254,18 @@ mod tests {
             let original_size = (*(heap.head as *mut Node)).size;
 
             let first_head = heap.head;
-            let first_ptr = heap.alloc(Layout::from_size_align_unchecked(10, 4))?;
+            let ptr_a = heap.alloc(Layout::from_size_align_unchecked(10, 4))?;
             let layout = Layout::from_size_align_unchecked(17, 8);
-            let ptr = heap.alloc(layout.clone())?;
+            let ptr_b = heap.alloc(layout.clone())?;
 
-            heap.dealloc(ptr, layout);
+            heap.dealloc(ptr_b, layout);
 
-            assert_eq!(heap.head, ptr as usize - Node::size());
+            assert_eq!(heap.head, ptr_b as usize - Node::size());
             let node = heap.head as *mut Node;
             assert_eq!((*node).size, SIZE - 2 * Node::size() - 10);
             assert_eq!((*node).next, 0);
 
-            heap.dealloc(first_ptr, Layout::from_size_align_unchecked(10, 4));
+            heap.dealloc(ptr_a, Layout::from_size_align_unchecked(10, 4));
             assert_eq!(heap.head, first_head);
             let node = heap.head as *mut Node;
             assert_eq!((*node).size, original_size);
@@ -272,17 +278,23 @@ mod tests {
 
     #[test]
     fn dealloc_fifo() -> Result<()> {
+        // Allocate two blocks
+        // AAAABBB_____________
+        // Free block A
+        // ____BBB_____________
+        // Free block B
+        // ____________________
         unsafe {
             let mut heap = Allocator::new();
             heap.init();
 
             let first_head = heap.head;
-            let first_ptr = heap.alloc(Layout::from_size_align_unchecked(10, 4))?;
+            let ptr_a = heap.alloc(Layout::from_size_align_unchecked(10, 4))?;
             let layout = Layout::from_size_align_unchecked(17, 8);
-            let ptr = heap.alloc(layout.clone())?;
+            let ptr_b = heap.alloc(layout.clone())?;
             let final_head = heap.head;
 
-            heap.dealloc(first_ptr, Layout::from_size_align_unchecked(10, 4));
+            heap.dealloc(ptr_a, Layout::from_size_align_unchecked(10, 4));
 
             assert_eq!(heap.head, first_head);
             let node = heap.head as *mut Node;
@@ -290,13 +302,89 @@ mod tests {
             assert_eq!((*node).next, final_head);
             assert_eq!(heap.total, 17);
 
-            heap.dealloc(ptr, layout);
+            heap.dealloc(ptr_b, layout);
             assert_eq!((*node).next, 0);
             let node = heap.head as *mut Node;
             assert_eq!((*node).next, 0);
             assert_eq!((*node).size, SIZE - Node::size());
 
             assert_eq!(heap.total, 0);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn dealloc_middle() -> Result<()> {
+        // Allocate four blocks
+        // AAAABBBCCCDDD_______
+        // Free block A
+        // ____BBBCCCDDD_______
+        // Free block C
+        // ____BBB___DDD_______
+        unsafe {
+            let mut heap = Allocator::new();
+            heap.init();
+
+            let first_head = heap.head;
+            let layout = Layout::new::<u32>();
+            let ptr_a = heap.alloc(layout.clone())?;
+            let _ptr_b = heap.alloc(layout.clone())?;
+            let ptr_c = heap.alloc(layout.clone())?;
+            let _ptr_d = heap.alloc(layout.clone())?;
+            let final_head = heap.head; // After block D
+
+            heap.dealloc(ptr_a, layout.clone());
+
+            assert_eq!(heap.head, first_head);
+            let node_a = heap.head as *mut Node;
+            assert_eq!((*node_a).size, layout.size());
+            assert_eq!((*node_a).next, final_head);
+            assert_eq!(heap.total, layout.size() * 3);
+
+            heap.dealloc(ptr_c, layout);
+            let addr_c = ptr_c as usize - Node::size();
+            assert_eq!((*node_a).next, addr_c);
+            let node_c = addr_c as *mut Node;
+            assert_eq!((*node_c).next, final_head);
+            assert_eq!((*node_c).size, layout.size());
+
+            assert_eq!(heap.total, layout.size() * 2);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn dealloc_no_forward_coalescing() -> Result<()> {
+        // Allocate three blocks
+        // AAAABBBCCC__________
+        // Free block A
+        // ____BBBCCC__________
+        // Free block B
+        // _______CCC__________
+        unsafe {
+            let mut heap = Allocator::new();
+            heap.init();
+
+            let first_head = heap.head;
+            let layout = Layout::new::<u32>();
+            let ptr_a = heap.alloc(layout.clone())?;
+            let ptr_b = heap.alloc(layout.clone())?;
+            let _ptr_c = heap.alloc(layout.clone())?;
+            let final_head = heap.head; // After block D
+
+            heap.dealloc(ptr_a, layout.clone());
+
+            assert_eq!(heap.head, first_head);
+            let node_a = heap.head as *mut Node;
+            assert_eq!((*node_a).size, layout.size());
+            assert_eq!((*node_a).next, final_head);
+            assert_eq!(heap.total, layout.size() * 2);
+
+            heap.dealloc(ptr_b, layout);
+            assert_eq!((*node_a).next, final_head);
+            assert_eq!((*node_a).size, layout.size() * 2 + Node::size());
+
+            assert_eq!(heap.total, layout.size());
         }
         Ok(())
     }
