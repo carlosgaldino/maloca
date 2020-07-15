@@ -23,6 +23,14 @@ impl Node {
     const fn align() -> usize {
         mem::align_of::<Self>()
     }
+
+    fn next(&self) -> Option<*mut Self> {
+        if self.next == 0 {
+            return None;
+        }
+
+        Some(self.next as *mut Node)
+    }
 }
 
 #[derive(Debug)]
@@ -112,6 +120,14 @@ impl Allocator {
                 next: (*prev_node).next,
             });
             (*prev_node).next = ptr as usize;
+        }
+
+        if let Some(next) = (*ptr).next() {
+            let next_addr = align(addr + (*ptr).size + Node::size(), Node::align());
+            if next_addr == next as usize {
+                (*ptr).size += (*next).size + Node::size();
+                (*ptr).next = (*next).next;
+            }
         }
 
         // TODO: coalesce
@@ -219,24 +235,25 @@ mod tests {
             let mut heap = Allocator::new();
             heap.init();
 
+            let original_size = (*(heap.head as *mut Node)).size;
+
             let first_head = heap.head;
             let first_ptr = heap.alloc(Layout::from_size_align_unchecked(10, 4))?;
             let layout = Layout::from_size_align_unchecked(17, 8);
             let ptr = heap.alloc(layout.clone())?;
-            let final_head = heap.head;
 
             heap.dealloc(ptr, layout);
 
             assert_eq!(heap.head, ptr as usize - Node::size());
             let node = heap.head as *mut Node;
-            assert_eq!((*node).size, 17); // TODO: coalesce
-            assert_eq!((*node).next, final_head);
+            assert_eq!((*node).size, SIZE - 2 * Node::size() - 10);
+            assert_eq!((*node).next, 0);
 
             heap.dealloc(first_ptr, Layout::from_size_align_unchecked(10, 4));
             assert_eq!(heap.head, first_head);
             let node = heap.head as *mut Node;
-            assert_eq!((*node).size, 10); // TODO: coalesce
-            assert_eq!((*node).next, ptr as usize - Node::size());
+            assert_eq!((*node).size, original_size);
+            assert_eq!((*node).next, 0);
 
             assert_eq!(heap.total, 0);
         }
@@ -266,8 +283,9 @@ mod tests {
             heap.dealloc(ptr, layout);
             assert_eq!((*node).next, ptr as usize - Node::size());
             let node = (ptr as usize - Node::size()) as *mut Node;
-            assert_eq!((*node).next, final_head);
-            assert_eq!((*node).size, 17);
+            assert_eq!((*node).next, 0);
+            assert_eq!((*node).size, SIZE - 2 * Node::size() - 10); // TODO: head should coalesce with prev
+            assert_eq!((*(heap.head as *mut Node)).next, node as usize);
 
             assert_eq!(heap.total, 0);
         }
