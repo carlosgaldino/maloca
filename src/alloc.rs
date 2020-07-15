@@ -74,27 +74,17 @@ impl Allocator {
 
         assert_ne!(self.size, 0);
 
-        let head = self.head as *mut Node;
-        if layout.size() >= (*head).size {
+        let (addr, next) = allocate_first_fit(self.head, 0, layout);
+        if addr == 0 {
             return Err(());
         }
 
-        let addr = align(self.head, layout.align());
-        let ptr = addr as *mut Node;
-        let prev_size = (*ptr).size;
-        ptr.write(Node {
-            size: layout.size(),
-            next: 0,
-        });
+        if addr == self.head {
+            self.head = next;
+        }
 
         self.total += layout.size();
         let ptr = addr + Node::size();
-        self.head = align(ptr + layout.size(), Node::align());
-        let head = self.head as *mut Node;
-        head.write(Node {
-            size: prev_size - Node::size() - layout.size(),
-            next: 0,
-        });
 
         Ok(ptr as *mut _)
     }
@@ -183,6 +173,43 @@ unsafe fn coalesce(prev: usize, current: usize) {
         (*prev_node).size += (*ptr).size + Node::size();
         (*prev_node).next = (*ptr).next;
     }
+}
+
+unsafe fn allocate_first_fit(addr: usize, prev: usize, layout: Layout) -> (usize, usize) {
+    if addr == 0 {
+        return (addr, 0);
+    }
+
+    let node = addr as *mut Node;
+    if (*node).size >= layout.size() {
+        let spill = (*node).size - layout.size();
+        let mut next = (*node).next;
+        let size = if spill > Node::size() {
+            layout.size()
+        } else {
+            (*node).size
+        };
+        node.write(Node { size, next: 0 });
+
+        if spill > Node::size() {
+            let spill_addr = align(addr + size + Node::size(), Node::align());
+            let spill_node = spill_addr as *mut Node;
+            spill_node.write(Node {
+                size: spill - Node::size(),
+                next,
+            });
+            next = spill_addr;
+        }
+
+        if prev != 0 {
+            let prev_node = prev as *mut Node;
+            (*prev_node).next = next;
+        }
+
+        return (addr, next);
+    }
+
+    allocate_first_fit((*node).next, addr, layout)
 }
 
 #[cfg(test)]
@@ -385,6 +412,161 @@ mod tests {
             assert_eq!((*node_a).size, layout.size() * 2 + Node::size());
 
             assert_eq!(heap.total, layout.size());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn realloc_same_size() -> Result<()> {
+        // Allocate two blocks
+        // AAAABBB_____________
+        // Free block A
+        // ____BBB_____________
+        // Allocate block C same size as A
+        // CCCCBBB_____________
+        unsafe {
+            let mut heap = Allocator::new();
+            heap.init();
+
+            let first_head = heap.head;
+            let ptr_a = heap.alloc(Layout::from_size_align_unchecked(10, 4))?;
+            let layout = Layout::from_size_align_unchecked(17, 8);
+            let _ptr_b = heap.alloc(layout.clone())?;
+            let final_head = heap.head;
+
+            heap.dealloc(ptr_a, Layout::from_size_align_unchecked(10, 4));
+
+            assert_eq!(heap.head, first_head);
+            let node = heap.head as *mut Node;
+            assert_eq!((*node).size, 10);
+            assert_eq!((*node).next, final_head);
+            assert_eq!(heap.total, 17);
+
+            let ptr_c = heap.alloc(Layout::from_size_align_unchecked(10, 4))?;
+            assert_eq!(ptr_c as usize, ptr_a as usize);
+            assert_eq!(heap.head, final_head);
+
+            assert_eq!(heap.total, 27);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn realloc_smaller_size() -> Result<()> {
+        // Allocate two blocks
+        // AAAABBB_____________
+        // Free block A
+        // ____BBB_____________
+        // Allocate block C smaller than A
+        // CC__BBB_____________
+        unsafe {
+            let mut heap = Allocator::new();
+            heap.init();
+
+            let first_head = heap.head;
+            let layout = Layout::from_size_align_unchecked(64, 4);
+            let ptr_a = heap.alloc(layout.clone())?;
+            let _ptr_b = heap.alloc(layout.clone())?;
+            let final_head = heap.head;
+
+            heap.dealloc(ptr_a, layout.clone());
+
+            assert_eq!(heap.head, first_head);
+            let node = heap.head as *mut Node;
+            assert_eq!((*node).size, layout.size());
+            assert_eq!((*node).next, final_head);
+            assert_eq!(heap.total, layout.size());
+
+            let ptr_c = heap.alloc(Layout::from_size_align_unchecked(32, 4))?;
+            let node_c = (ptr_c as usize - Node::size()) as *mut Node;
+            assert_eq!((*node_c).size, 32);
+            assert_eq!(ptr_c as usize, ptr_a as usize);
+
+            assert_ne!(heap.head, final_head);
+            let head_node = heap.head as *mut Node;
+            assert_eq!((*head_node).next, final_head);
+
+            assert_eq!(heap.total, 96);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn realloc_smaller_size_no_new_node() -> Result<()> {
+        // Allocate two blocks
+        // AAAABBB_____________
+        // Free block A
+        // ____BBB_____________
+        // Allocate block C smaller than A but not enough to create a new node
+        // In this case there will be some unused space in the C node
+        // CCC~BBB_____________
+        unsafe {
+            let mut heap = Allocator::new();
+            heap.init();
+
+            let first_head = heap.head;
+            let layout = Layout::from_size_align_unchecked(64, 4);
+            let ptr_a = heap.alloc(layout.clone())?;
+            let _ptr_b = heap.alloc(layout.clone())?;
+            let final_head = heap.head;
+
+            heap.dealloc(ptr_a, layout.clone());
+
+            assert_eq!(heap.head, first_head);
+            let node = heap.head as *mut Node;
+            assert_eq!((*node).size, layout.size());
+            assert_eq!((*node).next, final_head);
+            assert_eq!(heap.total, layout.size());
+
+            let ptr_c = heap.alloc(Layout::from_size_align_unchecked(48, 4))?;
+            let node_c = (ptr_c as usize - Node::size()) as *mut Node;
+            assert_eq!((*node_c).size, 64);
+            assert_eq!(ptr_c as usize, ptr_a as usize);
+
+            assert_eq!(heap.head, final_head);
+
+            assert_eq!(heap.total, 112);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn realloc_bigger_size() -> Result<()> {
+        // Allocate two blocks
+        // AAAABBB_____________
+        // Free block A
+        // ____BBB_____________
+        // Allocate block C greater than A
+        // ____BBBCCCCCCCC_____
+        unsafe {
+            let mut heap = Allocator::new();
+            heap.init();
+
+            let first_head = heap.head;
+            let layout = Layout::from_size_align_unchecked(64, 4);
+            let ptr_a = heap.alloc(layout.clone())?;
+            let _ptr_b = heap.alloc(layout.clone())?;
+            let final_head = heap.head;
+
+            heap.dealloc(ptr_a, layout.clone());
+
+            assert_eq!(heap.head, first_head);
+            let node = heap.head as *mut Node;
+            assert_eq!((*node).size, layout.size());
+            assert_eq!((*node).next, final_head);
+            assert_eq!(heap.total, layout.size());
+
+            let ptr_c = heap.alloc(Layout::from_size_align_unchecked(128, 4))?;
+            let node_c = (ptr_c as usize - Node::size()) as *mut Node;
+            assert_eq!((*node_c).size, 128);
+            assert_eq!(ptr_c as usize, final_head + Node::size());
+
+            assert_eq!(heap.head, ptr_a as usize - Node::size());
+
+            let head_node = heap.head as *mut Node;
+            assert_eq!((*head_node).next, ptr_c as usize + 128);
+
+            assert_eq!(heap.total, 192);
         }
         Ok(())
     }
