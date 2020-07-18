@@ -5,7 +5,7 @@ use core::{
 use memmap::MmapMut;
 use spin::Mutex;
 
-const SIZE: usize = 1024 * 1024;
+const SIZE: usize = 1024 * 1024 * 100;
 
 #[derive(Debug)]
 struct Node {
@@ -23,13 +23,31 @@ impl Node {
     const fn align() -> usize {
         mem::align_of::<Self>()
     }
+
+    #[inline(always)]
+    fn adjust_size(size: usize) -> usize {
+        Layout::from_size_align(size, Self::align())
+            .expect("node layout")
+            .pad_to_align()
+            .size()
+    }
+
+    #[inline(always)]
+    fn update(addr: usize, size: usize, next: usize) {
+        let ptr = addr as *mut Node;
+        unsafe {
+            (*ptr).size = size;
+            (*ptr).next = next;
+        }
+    }
 }
 
 #[derive(Debug)]
 struct Allocator {
     pub head: usize,
     pub size: usize,
-    pub total: usize,
+    pub total: usize, // including node size
+    pub allocated: usize,
     mmap: Option<MmapMut>,
 }
 
@@ -39,6 +57,7 @@ impl Allocator {
             head: 0,
             size: 0,
             total: 0,
+            allocated: 0,
             mmap: None,
         }
     }
@@ -51,12 +70,9 @@ impl Allocator {
         self.head = mmap.as_ptr() as usize;
         self.size = SIZE;
         self.mmap = Some(mmap);
-        let ptr = self.head as *mut Node;
+        self.total = Node::size();
 
-        ptr.write(Node {
-            size: self.size - Node::size(),
-            next: 0,
-        });
+        Node::update(self.head, self.size - Node::size(), 0);
     }
 
     unsafe fn alloc(&mut self, layout: Layout) -> Result<*mut u8, ()> {
@@ -64,9 +80,12 @@ impl Allocator {
             self.init();
         }
 
-        assert_ne!(self.size, 0);
+        assert!(self.size != 0);
+        if self.total == self.size {
+            return Err(());
+        }
 
-        let (addr, next) = allocate_first_fit(self.head, 0, layout);
+        let (addr, next) = self.allocate_first_fit(self.head, 0, layout);
         if addr == 0 {
             return Err(());
         }
@@ -75,7 +94,10 @@ impl Allocator {
             self.head = next;
         }
 
-        self.total += layout.size();
+        let ptr = addr as *mut Node;
+        assert!((*ptr).next == 0);
+        self.total += (*ptr).size;
+        self.allocated += layout.size();
         let ptr = addr + Node::size();
 
         Ok(ptr as *mut _)
@@ -87,32 +109,83 @@ impl Allocator {
         let addr = ptr as usize - Node::size();
         let prev = find_previous_node(addr, self.head);
         let ptr = addr as *mut Node;
+        let size = (*ptr).size;
 
         if prev == 0 {
-            ptr.write(Node {
-                size: (*ptr).size,
-                next: self.head,
-            });
-
+            assert!(addr != self.head);
+            Node::update(addr, size, self.head);
             self.head = addr;
         } else {
             let prev_node = prev as *mut Node;
-            ptr.write(Node {
-                size: (*ptr).size,
-                next: (*prev_node).next,
-            });
-            (*prev_node).next = ptr as usize;
+            Node::update(addr, size, (*prev_node).next);
+            Node::update(prev, (*prev_node).size, addr);
         }
 
         if (*ptr).next != 0 {
-            coalesce(addr, (*ptr).next);
+            self.coalesce(addr, (*ptr).next);
         }
 
         if prev != 0 {
-            coalesce(prev, addr);
+            self.coalesce(prev, addr);
         }
 
-        self.total -= layout.size();
+        self.allocated = self.allocated.saturating_sub(layout.size());
+        self.total = self.total.saturating_sub(size);
+    }
+
+    unsafe fn allocate_first_fit(
+        &mut self,
+        addr: usize,
+        prev: usize,
+        layout: Layout,
+    ) -> (usize, usize) {
+        if addr == 0 {
+            return (addr, 0);
+        }
+
+        let mut prev = prev;
+        let mut node = addr as *mut Node;
+        while (*node).size < layout.size() {
+            if (*node).next == 0 {
+                return (0, 0);
+            }
+            prev = node as usize;
+            node = (*node).next as *mut Node;
+        }
+
+        let addr = node as usize;
+        let adjusted_size = Node::adjust_size(layout.size());
+        let spill = (*node).size - adjusted_size;
+        let mut next = (*node).next;
+        Node::update(addr, adjusted_size, 0);
+
+        if spill > Node::size() {
+            let spill_addr = align(addr + adjusted_size + Node::size(), Node::align());
+            let spill_size = Node::adjust_size(spill.saturating_sub(Node::size()));
+            Node::update(spill_addr, spill_size, next);
+            self.total += Node::size();
+            next = spill_addr;
+        }
+
+        if prev != 0 {
+            let prev_node = prev as *mut Node;
+            Node::update(prev, (*prev_node).size, next);
+        }
+
+        (addr, next)
+    }
+
+    #[inline(always)]
+    unsafe fn coalesce(&mut self, prev: usize, next: usize) {
+        let prev_node = prev as *mut Node;
+        let next_addr = align(prev + (*prev_node).size + Node::size(), Node::align());
+        if next_addr == next {
+            let ptr = next as *mut Node;
+            let new_size = Node::adjust_size((*prev_node).size + (*ptr).size + Node::size());
+            Node::update(prev, new_size, (*ptr).next);
+            Node::update(next, 0, 0);
+            self.total = self.total.saturating_sub(Node::size());
+        }
     }
 }
 
@@ -142,7 +215,7 @@ fn align(addr: usize, align: usize) -> usize {
 
 #[inline]
 fn find_previous_node(addr: usize, head: usize) -> usize {
-    if addr < head {
+    if addr < head as usize {
         return 0;
     }
 
@@ -154,54 +227,6 @@ fn find_previous_node(addr: usize, head: usize) -> usize {
     }
 
     node as usize
-}
-
-#[inline]
-unsafe fn coalesce(prev: usize, current: usize) {
-    let prev_node = prev as *mut Node;
-    let next_addr = align(prev + (*prev_node).size + Node::size(), Node::align());
-    if next_addr == current {
-        let ptr = current as *mut Node;
-        (*prev_node).size += (*ptr).size + Node::size();
-        (*prev_node).next = (*ptr).next;
-    }
-}
-
-unsafe fn allocate_first_fit(addr: usize, prev: usize, layout: Layout) -> (usize, usize) {
-    if addr == 0 {
-        return (addr, 0);
-    }
-
-    let node = addr as *mut Node;
-    if (*node).size >= layout.size() {
-        let spill = (*node).size - layout.size();
-        let mut next = (*node).next;
-        let size = if spill > Node::size() {
-            layout.size()
-        } else {
-            (*node).size
-        };
-        node.write(Node { size, next: 0 });
-
-        if spill > Node::size() {
-            let spill_addr = align(addr + size + Node::size(), Node::align());
-            let spill_node = spill_addr as *mut Node;
-            spill_node.write(Node {
-                size: spill - Node::size(),
-                next,
-            });
-            next = spill_addr;
-        }
-
-        if prev != 0 {
-            let prev_node = prev as *mut Node;
-            (*prev_node).next = next;
-        }
-
-        return (addr, next);
-    }
-
-    allocate_first_fit((*node).next, addr, layout)
 }
 
 #[cfg(test)]
@@ -228,13 +253,14 @@ mod tests {
             assert_eq!((*node).size, SIZE - Node::size());
 
             let ptr = heap.alloc(Layout::from_size_align_unchecked(10, 4))?;
-
             assert_eq!(ptr as usize, node as usize + Node::size());
 
             let node = heap.head as *mut Node;
-            assert_eq!((*node).size, SIZE - 2 * Node::size() - 10);
+            let padding = 6;
+            assert_eq!((*node).size, SIZE - 2 * Node::size() - 10 - padding);
 
-            assert_eq!(heap.total, 10);
+            assert_eq!(heap.allocated, 10);
+            assert_eq!(heap.total, 10 + padding + 2 * Node::size());
         }
         Ok(())
     }
@@ -252,8 +278,10 @@ mod tests {
             assert_eq!(ptr as usize, Node::size() + aligned);
 
             let node = heap.head as *mut Node;
-            assert_eq!((*node).size, SIZE - 3 * Node::size() - 27);
-            assert_eq!(heap.total, 27);
+            let padding = 6 + 7;
+            assert_eq!((*node).size, SIZE - 3 * Node::size() - 27 - padding);
+            assert_eq!(heap.total, 27 + padding + 3 * Node::size());
+            assert_eq!(heap.allocated, 27);
         }
         Ok(())
     }
@@ -281,7 +309,8 @@ mod tests {
 
             assert_eq!(heap.head, ptr_b as usize - Node::size());
             let node = heap.head as *mut Node;
-            assert_eq!((*node).size, SIZE - 2 * Node::size() - 10);
+            let padding = 6;
+            assert_eq!((*node).size, SIZE - 2 * Node::size() - 10 - padding);
             assert_eq!((*node).next, 0);
 
             heap.dealloc(ptr_a, Layout::from_size_align_unchecked(10, 4));
@@ -290,7 +319,8 @@ mod tests {
             assert_eq!((*node).size, original_size);
             assert_eq!((*node).next, 0);
 
-            assert_eq!(heap.total, 0);
+            assert_eq!(heap.allocated, 0);
+            assert_eq!(heap.total, Node::size());
         }
         Ok(())
     }
@@ -317,9 +347,11 @@ mod tests {
 
             assert_eq!(heap.head, first_head);
             let node = heap.head as *mut Node;
-            assert_eq!((*node).size, 10);
+            let padding_b = 7;
+            assert_eq!((*node).size, 16); // + padding
             assert_eq!((*node).next, final_head);
-            assert_eq!(heap.total, 17);
+            assert_eq!(heap.total, 17 + padding_b + 3 * Node::size());
+            assert_eq!(heap.allocated, 17);
 
             heap.dealloc(ptr_b, layout);
             assert_eq!((*node).next, 0);
@@ -327,7 +359,8 @@ mod tests {
             assert_eq!((*node).next, 0);
             assert_eq!((*node).size, SIZE - Node::size());
 
-            assert_eq!(heap.total, 0);
+            assert_eq!(heap.allocated, 0);
+            assert_eq!(heap.total, Node::size());
         }
         Ok(())
     }
@@ -356,18 +389,36 @@ mod tests {
 
             assert_eq!(heap.head, first_head);
             let node_a = heap.head as *mut Node;
-            assert_eq!((*node_a).size, layout.size());
+            assert_eq!(
+                (*node_a).size,
+                Layout::from_size_align_unchecked(layout.size(), Node::align())
+                    .pad_to_align()
+                    .size()
+            );
             assert_eq!((*node_a).next, final_head);
-            assert_eq!(heap.total, layout.size() * 3);
+            assert_eq!(heap.allocated, layout.size() * 3);
+            assert_eq!(
+                heap.total,
+                layout.size() * 3 + Node::size() * 5 + 3 * 4 /* padding */
+            );
 
             heap.dealloc(ptr_c, layout);
             let addr_c = ptr_c as usize - Node::size();
             assert_eq!((*node_a).next, addr_c);
             let node_c = addr_c as *mut Node;
             assert_eq!((*node_c).next, final_head);
-            assert_eq!((*node_c).size, layout.size());
+            assert_eq!(
+                (*node_c).size,
+                Layout::from_size_align_unchecked(layout.size(), Node::align())
+                    .pad_to_align()
+                    .size()
+            );
 
-            assert_eq!(heap.total, layout.size() * 2);
+            assert_eq!(heap.allocated, layout.size() * 2);
+            assert_eq!(
+                heap.total,
+                layout.size() * 2 + Node::size() * 5 + 2 * 4 /* padding */
+            );
         }
         Ok(())
     }
@@ -395,15 +446,30 @@ mod tests {
 
             assert_eq!(heap.head, first_head);
             let node_a = heap.head as *mut Node;
-            assert_eq!((*node_a).size, layout.size());
+            assert_eq!(
+                (*node_a).size,
+                Layout::from_size_align_unchecked(layout.size(), Node::align())
+                    .pad_to_align()
+                    .size()
+            );
             assert_eq!((*node_a).next, final_head);
-            assert_eq!(heap.total, layout.size() * 2);
+            assert_eq!(
+                heap.total,
+                layout.size() * 2 + Node::size() * 4 + 2 * 4 /* padding */
+            );
 
             heap.dealloc(ptr_b, layout);
             assert_eq!((*node_a).next, final_head);
-            assert_eq!((*node_a).size, layout.size() * 2 + Node::size());
+            assert_eq!(
+                (*node_a).size,
+                Node::size() + layout.size() * 2 * 2 /* padding for 2 pointers */
+            );
 
-            assert_eq!(heap.total, layout.size());
+            assert_eq!(heap.allocated, layout.size());
+            assert_eq!(
+                heap.total,
+                layout.size() + 3 * Node::size() + 4 /* padding */
+            );
         }
         Ok(())
     }
@@ -430,15 +496,21 @@ mod tests {
 
             assert_eq!(heap.head, first_head);
             let node = heap.head as *mut Node;
-            assert_eq!((*node).size, 10);
+            let padding = 6;
+            assert_eq!((*node).size, 10 + padding);
             assert_eq!((*node).next, final_head);
-            assert_eq!(heap.total, 17);
+            assert_eq!(heap.allocated, 17);
+            assert_eq!(heap.total, 17 + 7 /* padding */ + 3 * Node::size());
 
             let ptr_c = heap.alloc(Layout::from_size_align_unchecked(10, 4))?;
             assert_eq!(ptr_c as usize, ptr_a as usize);
             assert_eq!(heap.head, final_head);
+            let head_node = heap.head as *mut Node;
+            assert_eq!((*head_node).next, 0);
 
-            assert_eq!(heap.total, 27);
+            let padding = 6 + 7;
+            assert_eq!(heap.allocated, 27);
+            assert_eq!(heap.total, 27 + padding + 3 * Node::size());
         }
         Ok(())
     }
@@ -467,7 +539,8 @@ mod tests {
             let node = heap.head as *mut Node;
             assert_eq!((*node).size, layout.size());
             assert_eq!((*node).next, final_head);
-            assert_eq!(heap.total, layout.size());
+            assert_eq!(heap.allocated, layout.size());
+            assert_eq!(heap.total, layout.size() + 3 * Node::size());
 
             let ptr_c = heap.alloc(Layout::from_size_align_unchecked(32, 4))?;
             let node_c = (ptr_c as usize - Node::size()) as *mut Node;
@@ -478,7 +551,8 @@ mod tests {
             let head_node = heap.head as *mut Node;
             assert_eq!((*head_node).next, final_head);
 
-            assert_eq!(heap.total, 96);
+            assert_eq!(heap.allocated, 96);
+            assert_eq!(heap.total, 32 + 64 + 4 * Node::size());
         }
         Ok(())
     }
@@ -508,16 +582,20 @@ mod tests {
             let node = heap.head as *mut Node;
             assert_eq!((*node).size, layout.size());
             assert_eq!((*node).next, final_head);
-            assert_eq!(heap.total, layout.size());
+            assert_eq!(heap.allocated, layout.size());
+            assert_eq!(heap.total, layout.size() + 3 * Node::size());
 
             let ptr_c = heap.alloc(Layout::from_size_align_unchecked(48, 4))?;
             let node_c = (ptr_c as usize - Node::size()) as *mut Node;
-            assert_eq!((*node_c).size, 64);
+            assert_eq!((*node_c).size, 48);
             assert_eq!(ptr_c as usize, ptr_a as usize);
 
             assert_eq!(heap.head, final_head);
+            let head_node = heap.head as *mut Node;
+            assert_eq!((*head_node).next, 0);
 
-            assert_eq!(heap.total, 112);
+            assert_eq!(heap.allocated, 112);
+            assert_eq!(heap.total, 64 + 48 + 3 * Node::size());
         }
         Ok(())
     }
@@ -546,7 +624,8 @@ mod tests {
             let node = heap.head as *mut Node;
             assert_eq!((*node).size, layout.size());
             assert_eq!((*node).next, final_head);
-            assert_eq!(heap.total, layout.size());
+            assert_eq!(heap.allocated, layout.size());
+            assert_eq!(heap.total, layout.size() + 3 * Node::size());
 
             let ptr_c = heap.alloc(Layout::from_size_align_unchecked(128, 4))?;
             let node_c = (ptr_c as usize - Node::size()) as *mut Node;
@@ -558,7 +637,8 @@ mod tests {
             let head_node = heap.head as *mut Node;
             assert_eq!((*head_node).next, ptr_c as usize + 128);
 
-            assert_eq!(heap.total, 192);
+            assert_eq!(heap.allocated, 128 + 64);
+            assert_eq!(heap.total, 128 + 64 + 4 * Node::size());
         }
         Ok(())
     }
