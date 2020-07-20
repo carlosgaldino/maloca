@@ -85,22 +85,21 @@ impl Allocator {
             return Err(());
         }
 
-        let (addr, next) = self.allocate_first_fit(self.head, 0, layout);
-        if addr == 0 {
-            return Err(());
+        if let Some((addr, next)) = self.allocate_first_fit(self.head, 0, layout) {
+            if addr == self.head {
+                self.head = next;
+            }
+
+            let ptr = addr as *mut Node;
+            assert!((*ptr).next == 0);
+            self.total += (*ptr).size;
+            self.allocated += layout.size();
+            let ptr = addr + Node::size();
+
+            Ok(ptr as *mut _)
+        } else {
+            Err(())
         }
-
-        if addr == self.head {
-            self.head = next;
-        }
-
-        let ptr = addr as *mut Node;
-        assert!((*ptr).next == 0);
-        self.total += (*ptr).size;
-        self.allocated += layout.size();
-        let ptr = addr + Node::size();
-
-        Ok(ptr as *mut _)
     }
 
     unsafe fn dealloc(&mut self, ptr: *mut u8, layout: Layout) {
@@ -138,16 +137,16 @@ impl Allocator {
         addr: usize,
         prev: usize,
         layout: Layout,
-    ) -> (usize, usize) {
+    ) -> Option<(usize, usize)> {
         if addr == 0 {
-            return (addr, 0);
+            return None;
         }
 
         let mut prev = prev;
         let mut node = addr as *mut Node;
         while (*node).size < layout.size() {
             if (*node).next == 0 {
-                return (0, 0);
+                return None;
             }
             prev = node as usize;
             node = (*node).next as *mut Node;
@@ -172,7 +171,7 @@ impl Allocator {
             Node::update(prev, (*prev_node).size, next);
         }
 
-        (addr, next)
+        Some((addr, next))
     }
 
     #[inline(always)]
